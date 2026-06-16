@@ -47,6 +47,7 @@ pub mod coprocessor_v2;
 pub mod import;
 pub mod read_pool;
 pub mod server;
+pub mod encoded_ops;
 pub mod shardkey;
 pub mod storage;
 
