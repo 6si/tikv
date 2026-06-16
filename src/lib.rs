@@ -54,7 +54,6 @@ pub mod coprocessor_v2;
 pub mod import;
 pub mod read_pool;
 pub mod server;
-pub mod shardkey;
 pub mod storage;
 
 /// Returns the tikv version information.
