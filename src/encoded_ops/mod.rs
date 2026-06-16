@@ -94,6 +94,122 @@ impl EncodedBloomFilterHint {
     }
 }
 
+/// Encoded filter request relayed from TiDB planner to TiFlash.
+/// Describes a filter predicate on a dictionary-encoded column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedFilterRequest {
+    /// Column being filtered
+    pub column_id: i64,
+    /// Filter type: "eq", "ne", "in", "like", "range"
+    pub filter_type: String,
+    /// Constant values for the filter (serialized)
+    pub filter_values: Vec<Vec<u8>>,
+    /// Whether this filter can use the encoded path
+    pub can_use_encoded_path: bool,
+}
+
+/// Encoded group-by request relayed from TiDB planner to TiFlash.
+/// Describes a group-by that can operate directly on dictionary IDs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedGroupByRequest {
+    /// Column IDs being grouped on
+    pub group_by_column_ids: Vec<i64>,
+    /// Aggregate functions requested
+    pub agg_funcs: Vec<AggFuncType>,
+    /// Column IDs being aggregated
+    pub agg_column_ids: Vec<i64>,
+    /// Estimated number of groups (from TiDB stats)
+    pub estimated_groups: u64,
+    /// Whether array-indexed aggregation is feasible
+    pub can_use_encoded_path: bool,
+}
+
+/// Aggregate function types supported in encoded group-by.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggFuncType {
+    Sum,
+    Count,
+    Min,
+    Max,
+    Any,
+}
+
+/// Encoded star join request relayed from TiDB planner to TiFlash.
+/// Describes a fused join+group-by+aggregate pipeline on encoded data.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedStarJoinRequest {
+    /// Fact table ID
+    pub fact_table_id: i64,
+    /// Dimension joins in the star schema
+    pub dimension_joins: Vec<DimensionJoinRequest>,
+    /// Whether GROUP BY is present above the join
+    pub has_group_by_above: bool,
+    /// Whether fused scan→join→agg is feasible
+    pub can_use_fused_path: bool,
+}
+
+/// One dimension in a star join request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DimensionJoinRequest {
+    /// Dimension table ID
+    pub dimension_table_id: i64,
+    /// Foreign key column in fact table
+    pub fact_join_column_id: i64,
+    /// Primary key column in dimension table
+    pub dim_join_column_id: i64,
+    /// Column from dimension used in GROUP BY
+    pub dim_group_column_id: i64,
+    /// Estimated dimension table size
+    pub estimated_dim_size: u64,
+}
+
+/// Full encoded operations request combining all phases.
+/// This is attached to the coprocessor DAGRequest for TiFlash.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EncodedOpsRequest {
+    /// Base encoding hint (Phase 1)
+    pub encoding_hint: Option<EncodingHint>,
+    /// Filter requests (Phase 2)
+    pub filter_requests: Vec<EncodedFilterRequest>,
+    /// Group-by request (Phase 3)
+    pub group_by_request: Option<EncodedGroupByRequest>,
+    /// Star join request (Phase 4)
+    pub star_join_request: Option<EncodedStarJoinRequest>,
+}
+
+impl EncodedOpsRequest {
+    /// Create a new empty request
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if any encoded operations are requested
+    pub fn has_any_ops(&self) -> bool {
+        self.encoding_hint.is_some()
+            || !self.filter_requests.is_empty()
+            || self.group_by_request.is_some()
+            || self.star_join_request.is_some()
+    }
+
+    /// Get the number of phases with active requests
+    pub fn active_phases(&self) -> u32 {
+        let mut count = 0;
+        if self.encoding_hint.is_some() {
+            count += 1;
+        }
+        if !self.filter_requests.is_empty() {
+            count += 1;
+        }
+        if self.group_by_request.is_some() {
+            count += 1;
+        }
+        if self.star_join_request.is_some() {
+            count += 1;
+        }
+        count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +252,110 @@ mod tests {
         assert_eq!(hint.column_id, 5);
         // Bloom filter should never return false negative
         assert!(hint.might_contain(123));
+    }
+
+    #[test]
+    fn test_encoded_filter_request() {
+        let req = EncodedFilterRequest {
+            column_id: 10,
+            filter_type: "eq".to_string(),
+            filter_values: vec![b"hello".to_vec()],
+            can_use_encoded_path: true,
+        };
+        assert_eq!(req.column_id, 10);
+        assert_eq!(req.filter_type, "eq");
+        assert!(req.can_use_encoded_path);
+    }
+
+    #[test]
+    fn test_encoded_group_by_request() {
+        let req = EncodedGroupByRequest {
+            group_by_column_ids: vec![1, 2],
+            agg_funcs: vec![AggFuncType::Sum, AggFuncType::Count],
+            agg_column_ids: vec![3, 0],
+            estimated_groups: 100,
+            can_use_encoded_path: true,
+        };
+        assert_eq!(req.group_by_column_ids.len(), 2);
+        assert_eq!(req.agg_funcs.len(), 2);
+        assert_eq!(req.estimated_groups, 100);
+        assert!(req.can_use_encoded_path);
+    }
+
+    #[test]
+    fn test_encoded_star_join_request() {
+        let req = EncodedStarJoinRequest {
+            fact_table_id: 1,
+            dimension_joins: vec![
+                DimensionJoinRequest {
+                    dimension_table_id: 2,
+                    fact_join_column_id: 10,
+                    dim_join_column_id: 1,
+                    dim_group_column_id: 2,
+                    estimated_dim_size: 500,
+                },
+                DimensionJoinRequest {
+                    dimension_table_id: 3,
+                    fact_join_column_id: 11,
+                    dim_join_column_id: 1,
+                    dim_group_column_id: 3,
+                    estimated_dim_size: 100,
+                },
+            ],
+            has_group_by_above: true,
+            can_use_fused_path: true,
+        };
+        assert_eq!(req.fact_table_id, 1);
+        assert_eq!(req.dimension_joins.len(), 2);
+        assert!(req.has_group_by_above);
+        assert!(req.can_use_fused_path);
+    }
+
+    #[test]
+    fn test_encoded_ops_request_empty() {
+        let req = EncodedOpsRequest::new();
+        assert!(!req.has_any_ops());
+        assert_eq!(req.active_phases(), 0);
+    }
+
+    #[test]
+    fn test_encoded_ops_request_full() {
+        let req = EncodedOpsRequest {
+            encoding_hint: Some(EncodingHint {
+                dict_eligible_columns: vec![1],
+                max_cardinality: 4096,
+                enable_encoded_filter: true,
+                enable_encoded_group_by: true,
+                enable_encoded_bloom_filter: false,
+            }),
+            filter_requests: vec![EncodedFilterRequest {
+                column_id: 1,
+                filter_type: "eq".to_string(),
+                filter_values: vec![],
+                can_use_encoded_path: true,
+            }],
+            group_by_request: Some(EncodedGroupByRequest {
+                group_by_column_ids: vec![1],
+                agg_funcs: vec![AggFuncType::Sum],
+                agg_column_ids: vec![2],
+                estimated_groups: 50,
+                can_use_encoded_path: true,
+            }),
+            star_join_request: Some(EncodedStarJoinRequest {
+                fact_table_id: 1,
+                dimension_joins: vec![],
+                has_group_by_above: true,
+                can_use_fused_path: true,
+            }),
+        };
+        assert!(req.has_any_ops());
+        assert_eq!(req.active_phases(), 4);
+    }
+
+    #[test]
+    fn test_agg_func_type_clone() {
+        let func = AggFuncType::Sum;
+        let cloned = func.clone();
+        assert_eq!(func, cloned);
     }
 }
