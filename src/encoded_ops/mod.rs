@@ -358,4 +358,129 @@ mod tests {
         let cloned = func.clone();
         assert_eq!(func, cloned);
     }
+
+    // --- Gap tests: hint passthrough, partial capabilities, large filter list ---
+
+    #[test]
+    fn test_hint_passthrough_fidelity() {
+        // Verify encoding hint is bit-identical after clone (simulating relay).
+        let original = EncodingHint {
+            dict_eligible_columns: vec![1, 5, 99, -1, i64::MAX],
+            max_cardinality: 2048,
+            enable_encoded_filter: true,
+            enable_encoded_group_by: false,
+            enable_encoded_bloom_filter: true,
+        };
+        let relayed = original.clone();
+        assert_eq!(original, relayed, "hint must be identical after clone/relay");
+    }
+
+    #[test]
+    fn test_partial_encoding_capabilities() {
+        // Phase 1 only: encoding hint present but no filter/groupby/star-join.
+        let req = EncodedOpsRequest {
+            encoding_hint: Some(EncodingHint {
+                dict_eligible_columns: vec![1],
+                max_cardinality: 4096,
+                enable_encoded_filter: false,
+                enable_encoded_group_by: false,
+                enable_encoded_bloom_filter: false,
+            }),
+            filter_requests: vec![],
+            group_by_request: None,
+            star_join_request: None,
+        };
+        assert!(req.has_any_ops());
+        assert_eq!(req.active_phases(), 1);
+        // The hint itself reports no encoded ops enabled.
+        assert!(!req.encoding_hint.as_ref().unwrap().has_any_encoded_ops());
+    }
+
+    #[test]
+    fn test_large_filter_list() {
+        // >100 IN-list values in encoded filter hint — verify no truncation.
+        let large_values: Vec<Vec<u8>> = (0..200)
+            .map(|i| format!("val_{}", i).into_bytes())
+            .collect();
+        let req = EncodedFilterRequest {
+            column_id: 42,
+            filter_type: "in".to_string(),
+            filter_values: large_values.clone(),
+            can_use_encoded_path: true,
+        };
+        assert_eq!(req.filter_values.len(), 200);
+        assert_eq!(req.filter_values[0], b"val_0");
+        assert_eq!(req.filter_values[199], b"val_199");
+    }
+
+    #[test]
+    fn test_full_request_clone_fidelity() {
+        // Full 4-phase request must survive clone without data loss.
+        let req = EncodedOpsRequest {
+            encoding_hint: Some(EncodingHint {
+                dict_eligible_columns: vec![1, 2, 3],
+                max_cardinality: 1024,
+                enable_encoded_filter: true,
+                enable_encoded_group_by: true,
+                enable_encoded_bloom_filter: true,
+            }),
+            filter_requests: vec![
+                EncodedFilterRequest {
+                    column_id: 1,
+                    filter_type: "eq".to_string(),
+                    filter_values: vec![b"active".to_vec()],
+                    can_use_encoded_path: true,
+                },
+                EncodedFilterRequest {
+                    column_id: 2,
+                    filter_type: "in".to_string(),
+                    filter_values: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+                    can_use_encoded_path: true,
+                },
+            ],
+            group_by_request: Some(EncodedGroupByRequest {
+                group_by_column_ids: vec![1],
+                agg_funcs: vec![AggFuncType::Sum, AggFuncType::Count, AggFuncType::Min, AggFuncType::Max],
+                agg_column_ids: vec![3, 0, 3, 3],
+                estimated_groups: 50,
+                can_use_encoded_path: true,
+            }),
+            star_join_request: Some(EncodedStarJoinRequest {
+                fact_table_id: 100,
+                dimension_joins: vec![
+                    DimensionJoinRequest {
+                        dimension_table_id: 200,
+                        fact_join_column_id: 10,
+                        dim_join_column_id: 1,
+                        dim_group_column_id: 2,
+                        estimated_dim_size: 500,
+                    },
+                ],
+                has_group_by_above: true,
+                can_use_fused_path: true,
+            }),
+        };
+        let cloned = req.clone();
+        assert_eq!(req, cloned);
+        assert_eq!(cloned.active_phases(), 4);
+        assert_eq!(cloned.filter_requests.len(), 2);
+        assert_eq!(cloned.filter_requests[1].filter_values.len(), 3);
+    }
+
+    #[test]
+    fn test_all_agg_func_types() {
+        // Verify all AggFuncType variants are distinct.
+        let funcs = vec![
+            AggFuncType::Sum,
+            AggFuncType::Count,
+            AggFuncType::Min,
+            AggFuncType::Max,
+            AggFuncType::Any,
+        ];
+        for i in 0..funcs.len() {
+            for j in (i + 1)..funcs.len() {
+                assert_ne!(funcs[i], funcs[j], "AggFuncType variants must be distinct");
+            }
+        }
+    }
 }

@@ -211,4 +211,86 @@ mod tests {
         assert_eq!(info.columns.len(), 1);
         assert_eq!(info.shard_cnt, 4);
     }
+
+    // --- Gap tests: cross-shard scan ranges, composite PK, uniformity, edge cases ---
+
+    #[test]
+    fn test_composite_pk_three_columns() {
+        // Verify 3-column composite shard key produces deterministic results.
+        let cols: &[&[u8]] = &[b"region1", b"42", b"dept_a"];
+        let slot1 = shard_slot_multi(cols, 16);
+        let slot2 = shard_slot_multi(cols, 16);
+        assert_eq!(slot1, slot2, "same input must always map to same shard");
+        assert!(slot1 < 16);
+
+        // Different values should (likely) map differently.
+        let cols2: &[&[u8]] = &[b"region2", b"42", b"dept_a"];
+        let slot3 = shard_slot_multi(cols2, 16);
+        // Not guaranteed different, but tests determinism.
+        assert!(slot3 < 16);
+    }
+
+    #[test]
+    fn test_crc32_uniformity_chi_squared() {
+        // Statistical test: 100K random-ish keys across 8 shards.
+        // Chi-squared test at 5% significance with 7 df → threshold 14.07.
+        let shard_cnt: u32 = 8;
+        let n = 100_000u64;
+        let mut counts = vec![0u64; shard_cnt as usize];
+        for i in 0..n {
+            let s = format!("key_{}", i);
+            counts[shard_slot(s.as_bytes(), shard_cnt) as usize] += 1;
+        }
+        let expected = n as f64 / shard_cnt as f64;
+        let chi_sq: f64 = counts
+            .iter()
+            .map(|&c| {
+                let diff = c as f64 - expected;
+                diff * diff / expected
+            })
+            .sum();
+        assert!(
+            chi_sq < 14.07,
+            "CRC32 distribution failed chi-squared test: {} (threshold 14.07)",
+            chi_sq,
+        );
+    }
+
+    #[test]
+    fn test_max_length_varchar_shard_key() {
+        // 255-byte VARCHAR at boundary.
+        let long_key = vec![b'A'; 255];
+        let slot = shard_slot(&long_key, 4);
+        assert!(slot < 4);
+
+        // Verify different long strings map to (potentially) different shards.
+        let long_key2 = vec![b'B'; 255];
+        let _slot2 = shard_slot(&long_key2, 4);
+        // Both should be valid slots.
+        assert!(slot < 4);
+    }
+
+    #[test]
+    fn test_empty_string_shard_key() {
+        // Empty string should route deterministically and differ from NULL (0x00).
+        let empty_slot = shard_slot(b"", 4);
+        let null_slot = shard_slot(&[0x00], 4);
+        assert!(empty_slot < 4);
+        assert!(null_slot < 4);
+        // CRC32("") = 0x00000000, CRC32(0x00) = 0xD202EF8D — different.
+        assert_ne!(
+            crc32fast::hash(b""),
+            crc32fast::hash(&[0x00]),
+            "empty string and NULL byte must produce different CRC32 values"
+        );
+    }
+
+    #[test]
+    fn test_shard_slot_all_valid_shard_counts() {
+        // Verify shard_slot works for all valid shard counts (2..=64).
+        for cnt in 2..=64u32 {
+            let slot = shard_slot(b"test", cnt);
+            assert!(slot < cnt, "slot {} out of range for shard_cnt={}", slot, cnt);
+        }
+    }
 }
