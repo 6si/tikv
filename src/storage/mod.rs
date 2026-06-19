@@ -75,7 +75,7 @@ use std::{
 use api_version::{ApiV1, ApiV2, KeyMode, KvFormat, RawValue};
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use collections::HashMap;
-use concurrency_manager::{ConcurrencyManager, KeyHandleGuard};
+use concurrency_manager::{ConcurrencyManager, KeyHandleGuard, MaxTsUpdateSource};
 use engine_traits::{
     CF_DEFAULT, CF_LOCK, CF_WRITE, CfName, DATA_CFS, DATA_CFS_LEN, raw_ttl::ttl_to_expire_ts,
 };
@@ -1747,7 +1747,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 let command_duration = Instant::now();
 
                 concurrency_manager
-                    .update_max_ts(max_ts, "scan_lock")
+                    .update_max_ts(
+                        max_ts,
+                        MaxTsUpdateSource::new("scan_lock")
+                            .require_request_origin_check(ctx.get_request_origin()),
+                    )
                     .map_err(txn::Error::from)?;
                 let begin_instant = Instant::now();
                 // TODO: Though it's very unlikely to find a conflicting memory lock here, it's
@@ -1958,7 +1962,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         self.sched
             .get_sched_pool()
             // NOTE: we don't support background resource control for raw api.
-            .spawn("", metadata, pri, future)
+            .spawn("", metadata, pri, future, 0)
             .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
     }
 
@@ -3379,12 +3383,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             err.set_server_is_busy(busy_err);
             return FuturesEither::Left(future::err(Error::from(ErrorInner::Kv(err.into()))));
         }
-        FuturesEither::Right(
-            self.read_pool
+
+        let metadata = metadata.deep_clone();
+        let read_pool = self.read_pool.clone();
+        FuturesEither::Right(async move {
+            read_pool
                 .spawn_handle(future, priority, task_id, metadata, resource_limiter)
                 .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .and_then(future::ready),
-        )
+                .await?
+        })
     }
 
     pub fn update_txn_status_cache(
